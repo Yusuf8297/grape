@@ -624,126 +624,274 @@ def _extract_codons_left_to_right(node, codon_consumption):
 #  PI Grow Initialisation (Fagan, Fenton & O'Neill, 2016)
 # ─────────────────────────────────────────────────────────────────────────────
 
+class _PITreeNode:
+    """
+    A node in the derivation tree built during PI Grow initialisation.
+    
+    This is an internal helper class used only during PI Grow tree 
+    construction. It stores enough information to later extract codons
+    in left-to-right (mapper) order.
+    
+    Attributes
+    ----------
+    nt : str
+        Non-terminal symbol at this node (e.g., '<expr>').
+    depth : int
+        Depth of this node in the derivation tree.
+    prod_idx : int or None
+        Index of the chosen production rule for this non-terminal.
+    n_choices : int
+        Total number of production choices available for this non-terminal.
+    children : list of _PITreeNode
+        Child nodes (one per non-terminal in the chosen production).
+    """
+    __slots__ = ['nt', 'depth', 'prod_idx', 'n_choices', 'children']
+    
+    def __init__(self, nt, depth):
+        self.nt = nt
+        self.depth = depth
+        self.prod_idx = None
+        self.n_choices = 0
+        self.children = []
+
+def _extract_codons_left_to_right(node, codon_consumption):
+    """
+    Traverse the derivation tree depth-first left-to-right, collecting
+    (prod_idx, n_choices) pairs in the order the GRAPE mapper would 
+    consume them.
+    
+    Parameters
+    ----------
+    node : _PITreeNode
+        Root node to start traversal from.
+    codon_consumption : str
+        'eager' or 'lazy'. In lazy mode, codons are only recorded when
+        the non-terminal has more than one production choice.
+    
+    Returns
+    -------
+    list of tuple (int, int)
+        List of (production_index, number_of_choices) pairs.
+    """
+    codons = []
+    if codon_consumption == 'eager':
+        codons.append((node.prod_idx, node.n_choices))
+    elif codon_consumption == 'lazy':
+        if node.n_choices > 1:
+            codons.append((node.prod_idx, node.n_choices))
+    for child in node.children:
+        codons.extend(_extract_codons_left_to_right(child, codon_consumption))
+    return codons
+
+def _grammar_min_derivation_depth(bnf_grammar):
+    """
+    Return the shortest derivation depth reachable from the start symbol.
+    
+    This equals the minimum value of production_rules[0][j][5] across all
+    productions of the start non-terminal, where index 5 stores the
+    minimum depth needed to derive a complete terminal string.
+    
+    Parameters
+    ----------
+    bnf_grammar : Grammar
+        A parsed BNF grammar object.
+    
+    Returns
+    -------
+    int
+        The minimum tree depth at which the grammar can produce a 
+        complete (terminal-only) sentence from the start symbol.
+    """
+    start_prods = bnf_grammar.production_rules[0]
+    return min(pr[5] for pr in start_prods)
+
+
+def _pick_forced_production(all_prods, depth_budget):
+ 
+    # Recursive choices that can terminate inside the budget
+    recursive_ok = [pr for pr in all_prods
+                    if pr[4] and pr[5] <= depth_budget]
+    if recursive_ok:
+        return random.choice(recursive_ok)
+    
+    # No recursive choice fits — any choice that terminates in time
+    any_ok = [pr for pr in all_prods if pr[5] <= depth_budget]
+    if any_ok:
+        return random.choice(any_ok)
+    
+    # Budget is exhausted — pick the shallowest termination path
+    min_depth = min(pr[5] for pr in all_prods)
+    return random.choice([pr for pr in all_prods if pr[5] == min_depth])
+
+
+def _pick_grow_production(all_prods, depth_budget):
+    """
+    Choose a production under standard *grow* semantics: any 
+    structurally legal production that terminates within the 
+    remaining depth budget.
+    
+    Parameters
+    ----------
+    all_prods : list
+        All production rules for the current non-terminal.
+    depth_budget : int
+        Remaining depth units from the current node to the target 
+        depth.
+    
+    Returns
+    -------
+    production
+        A single selected production rule.
+    """
+    fits = [pr for pr in all_prods if pr[5] <= depth_budget]
+    if fits:
+        return random.choice(fits)
+    
+    # Nothing fits — shortest termination path as fallback
+    min_depth = min(pr[5] for pr in all_prods)
+    return random.choice([pr for pr in all_prods if pr[5] == min_depth])
+
+
 def PI_Grow(ind_class, pop_size, bnf_grammar, min_init_depth,
             max_init_depth, codon_size, codon_consumption,
             genome_representation):
-    """
 
-    """
-    # Calculate the number of individuals per depth level (ramped)
-    n_sets = max_init_depth - min_init_depth + 1
-    set_size = int(pop_size / n_sets)
-    remaining = pop_size % n_sets
+    # ── Determine ramping range ──────────────────────────────────────
+    # Skip depths that can only produce trivial (single-terminal) 
+    # trees.  The effective minimum is one level above the grammar's 
+    # shallowest complete derivation.
+    grammar_floor = _grammar_min_derivation_depth(bnf_grammar) + 1
+    effective_min = max(min_init_depth, grammar_floor)
+    effective_min = min(effective_min, max_init_depth)   # safety clamp
+    
+    n_depth_levels = max_init_depth - effective_min + 1
+    per_level      = pop_size // n_depth_levels
+    leftover       = pop_size %  n_depth_levels
+    
+    # Pre-compute: which NTs in the grammar have at least one
+    # recursive production?  Used to tag queue entries so the
+    # depth-forcing logic can detect when the last recursive 
+    # gateway is about to be consumed.
+    nt_has_recursive = []
+    for nt_idx in range(len(bnf_grammar.non_terminals)):
+        nt_has_recursive.append(
+            any(pr[4] for pr in bnf_grammar.production_rules[nt_idx]))
     
     population = []
     
-    for i in range(n_sets):
-        max_init_depth_ = min_init_depth + i
-        # Distribute remaining individuals across the first depth levels
-        n_inds = set_size + (1 if i < remaining else 0)
+    for level_i in range(n_depth_levels):
+        target_depth = effective_min + level_i
+        n_inds = per_level + (1 if level_i < leftover else 0)
         
-        for j in range(n_inds):
-            # ── Phase 1: Build derivation tree (position independent) ──
+        for _ in range(n_inds):
+            # ── Phase 1: Build derivation tree (PI + depth forcing) ──
             
-            # Create root node(s) from start symbol
-            start_NTs = ['<' + term + '>' for term in 
-                         re.findall(r"\<([\(\)\w,-.]+)\>", 
+            # Identify non-terminals in the start rule
+            start_NTs = ['<' + t + '>' for t in 
+                         re.findall(r"\<([\(\)\w,-.]+)\>",
                                     bnf_grammar.start_rule)]
             if not start_NTs:
-                # Start rule is itself a single non-terminal
                 start_NTs = [bnf_grammar.start_rule]
             
             root_nodes = [_PITreeNode(nt, 1) for nt in start_NTs]
-            pending = list(root_nodes)  # Nodes awaiting expansion
+            
+            # Pending queue: each entry is (node, is_recursive_NT).
+            # The boolean records whether the NT at that node has any
+            # recursive production available — this lets us check 
+            # whether removing a node from the queue would leave zero
+            # recursive gateways, which would risk the tree 
+            # terminating before the target depth is reached.
+            pending = []
+            for rn in root_nodes:
+                idx = bnf_grammar.non_terminals.index(rn.nt)
+                pending.append((rn, nt_has_recursive[idx]))
+            
             deepest_reached = 1
             
             while pending:
-                # ── Position-independent: randomly choose which node ──
-                pi_idx = random.randint(0, len(pending) - 1)
-                node = pending.pop(pi_idx)
+                # ── Position-independent: random node selection ──
+                pi_idx  = random.randint(0, len(pending) - 1)
+                node, _ = pending.pop(pi_idx)
                 
-                idx_NT = bnf_grammar.non_terminals.index(node.nt)
-                total_options = bnf_grammar.production_rules[idx_NT]
+                idx_NT   = bnf_grammar.non_terminals.index(node.nt)
+                all_prods = bnf_grammar.production_rules[idx_NT]
+                depth_budget = target_depth - node.depth
                 
-                # Filter productions that can terminate within depth budget
-                actual_options = [PR for PR in total_options 
-                                  if PR[5] + node.depth <= max_init_depth_]
+                # Does the queue still contain at least one node 
+                # whose NT can recurse?
+                queue_has_recursive = any(r for _, r in pending)
                 
-                if not actual_options:
-                    # Fallback: try terminal productions
-                    actual_options = [PR for PR in total_options 
-                                      if PR[1] == 'terminal']
-                    if not actual_options:
-                        actual_options = list(total_options)
+                # ── Decide whether to force depth ────────────────
+                # Force recursive (branching) productions when:
+                #   (a) the tree has not yet reached target depth, OR
+                #   (b) no other recursive gateway remains in the 
+                #       queue (prevents premature termination).
+                # Once the target depth has been reached AND there 
+                # are still recursive gateways queued, switch to 
+                # standard grow semantics.
+                force = (deepest_reached < target_depth) or \
+                        (not queue_has_recursive)
                 
-                # ── Depth forcing: push at least one branch to max depth ──
-                if deepest_reached < max_init_depth_ and \
-                        node.depth >= deepest_reached:
-                    recursive_options = [PR for PR in actual_options 
-                                         if PR[4]]
-                    if recursive_options:
-                        Ch = random.choice(recursive_options)
-                    else:
-                        Ch = random.choice(actual_options)
+                if force:
+                    Ch = _pick_forced_production(all_prods, depth_budget)
                 else:
-                    # Standard Grow: random choice among feasible options
-                    Ch = random.choice(actual_options)
+                    Ch = _pick_grow_production(all_prods, depth_budget)
                 
-                # Record the choice in the tree node
-                node.prod_idx = Ch[3]
-                node.n_choices = len(total_options)
+                # Store the choice in the tree node for later 
+                # codon extraction
+                node.prod_idx  = Ch[3]
+                node.n_choices = len(all_prods)
                 
-                new_depth = node.depth + 1
-                if new_depth > deepest_reached:
-                    deepest_reached = new_depth
+                child_depth = node.depth + 1
+                if child_depth > deepest_reached:
+                    deepest_reached = child_depth
                 
-                # Create child nodes for NTs in the chosen production
+                # Spawn child nodes for every NT in the chosen 
+                # production
                 if Ch[1] == 'non-terminal':
-                    child_NTs = ['<' + term + '>' for term in 
-                                 re.findall(r"\<([\(\)\w,-.]+)\>", Ch[0])]
-                    for child_nt in child_NTs:
-                        child = _PITreeNode(child_nt, new_depth)
+                    child_NTs = [
+                        '<' + t + '>' for t in
+                        re.findall(r"\<([\(\)\w,-.]+)\>", Ch[0])]
+                    for cnt in child_NTs:
+                        child = _PITreeNode(cnt, child_depth)
                         node.children.append(child)
-                        pending.append(child)
+                        c_idx = bnf_grammar.non_terminals.index(cnt)
+                        pending.append(
+                            (child, nt_has_recursive[c_idx]))
             
-            # ── Phase 2: Extract codons in left-to-right order ──
-            # This ensures the genome, when mapped by GRAPE's mapper,
-            # reproduces the exact phenotype built by PI Grow.
-            
+            # ── Phase 2: Extract codons in mapper order ──────────
+            # Depth-first left-to-right traversal produces codons 
+            # in the order GRAPE's mapper will consume them.
             ordered_codons = []
             for root in root_nodes:
                 ordered_codons.extend(
-                    _extract_codons_left_to_right(root, codon_consumption))
+                    _extract_codons_left_to_right(
+                        root, codon_consumption))
             
-            
+            # Build the genome from the ordered codons
             remainders = []
-            possible_choices = []
-            genome = []
+            genome     = []
             for prod_idx, n_choices in ordered_codons:
                 remainders.append(prod_idx)
-                possible_choices.append(n_choices)
-                codon = (random.randint(0, int(1e10)) 
-                         % math.floor(((codon_size + 1) / n_choices)) 
+                codon = (random.randint(0, int(1e10))
+                         % math.floor(((codon_size + 1) / n_choices))
                          * n_choices) + prod_idx
                 genome.append(codon)
             
-            
-            size_tail = max(int(0.5 * len(genome)), 1)
-            for k in range(size_tail):
+            # Append a random tail (≥ 1 codon, ~50 % of used 
+            # length).  The tail is required for the lazy mapper 
+            # to terminate when the final production has only one 
+            # option.
+            tail_len = max(int(0.5 * len(genome)), 1)
+            for _ in range(tail_len):
                 genome.append(random.randint(0, codon_size))
             
-            # Initialise the individual and include in the population
-            ind = ind_class(genome, bnf_grammar, max_init_depth_, 
+            # Instantiate the individual and verify correctness
+            ind = ind_class(genome, bnf_grammar, target_depth,
                             codon_consumption)
             
-            # requires a minimum depth greater than max_init_depth_,
             if remainders != ind.structure or ind.invalid:
-                raise Exception('PI_Grow error in mapping. '
-                                'Structure expected ' + str(remainders) + 
-                                ' but got ' + str(ind.structure) +
-                                '. This may occur if the grammar requires '
-                                'a minimum depth greater than the target '
-                                'init depth (' + str(max_init_depth_) + ').')
+                raise Exception('PI_Grow error in mapping')
             
             population.append(ind)
     
@@ -755,7 +903,6 @@ def PI_Grow(ind_class, pop_size, bnf_grammar, min_init_depth,
         return population
     else:
         raise ValueError("Unknown genome representation")
-
             
 def crossover_onepoint(parent0, parent1, bnf_grammar, max_depth, codon_consumption, 
                        genome_representation='list', max_genome_length=None):
