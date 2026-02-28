@@ -556,74 +556,6 @@ def sensible_initialisation(ind_class, pop_size, bnf_grammar, min_init_depth,
             return population
         else:
             raise ValueError("Unkonwn genome representation")    
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Helper class for building derivation trees during PI Grow
-# ─────────────────────────────────────────────────────────────────────────────
-
-class _PITreeNode:
-    """
-    A node in the derivation tree built during PI Grow initialisation.
-    
-    This is an internal helper class used only during PI Grow tree 
-    construction. It stores enough information to later extract codons
-    in left-to-right (mapper) order.
-    
-    Attributes
-    ----------
-    nt : str
-        Non-terminal symbol at this node (e.g., '<expr>').
-    depth : int
-        Depth of this node in the derivation tree.
-    prod_idx : int or None
-        Index of the chosen production rule for this non-terminal.
-    n_choices : int
-        Total number of production choices available for this non-terminal.
-    children : list of _PITreeNode
-        Child nodes (one per non-terminal in the chosen production).
-    """
-    __slots__ = ['nt', 'depth', 'prod_idx', 'n_choices', 'children']
-    
-    def __init__(self, nt, depth):
-        self.nt = nt
-        self.depth = depth
-        self.prod_idx = None
-        self.n_choices = 0
-        self.children = []
-
-
-def _extract_codons_left_to_right(node, codon_consumption):
-    """
-    Traverse the derivation tree depth-first left-to-right, collecting
-    (prod_idx, n_choices) pairs in the order the GRAPE mapper would 
-    consume them.
-    
-    Parameters
-    ----------
-    node : _PITreeNode
-        Root node to start traversal from.
-    codon_consumption : str
-        'eager' or 'lazy'. In lazy mode, codons are only recorded when
-        the non-terminal has more than one production choice.
-    
-    Returns
-    -------
-    list of tuple (int, int)
-        List of (production_index, number_of_choices) pairs.
-    """
-    codons = []
-    if codon_consumption == 'eager':
-        codons.append((node.prod_idx, node.n_choices))
-    elif codon_consumption == 'lazy':
-        if node.n_choices > 1:
-            codons.append((node.prod_idx, node.n_choices))
-    for child in node.children:
-        codons.extend(_extract_codons_left_to_right(child, codon_consumption))
-    return codons
-# ─────────────────────────────────────────────────────────────────────────────
-#  PI Grow Initialisation (Fagan, Fenton & O'Neill, 2016)
-# ─────────────────────────────────────────────────────────────────────────────
-
 class _PITreeNode:
     """
     A node in the derivation tree built during PI Grow initialisation.
@@ -707,7 +639,30 @@ def _grammar_min_derivation_depth(bnf_grammar):
 
 
 def _pick_forced_production(all_prods, depth_budget):
- 
+    """
+    Choose a production when depth-forcing is active (analogous to
+    building a *full* tree branch).
+    
+    Strategy:
+    1. Prefer recursive productions that fit within the depth budget,
+       so that the tree keeps branching deeper.
+    2. If no recursive production fits, accept any production that 
+       can terminate within the budget.
+    3. Last resort: pick the shallowest-terminating production.
+    
+    Parameters
+    ----------
+    all_prods : list
+        All production rules for the current non-terminal.
+    depth_budget : int
+        Remaining depth units from the current node to the target 
+        depth (i.e. target_depth − node.depth).
+    
+    Returns
+    -------
+    production
+        A single selected production rule.
+    """
     # Recursive choices that can terminate inside the budget
     recursive_ok = [pr for pr in all_prods
                     if pr[4] and pr[5] <= depth_budget]
@@ -755,13 +710,42 @@ def _pick_grow_production(all_prods, depth_budget):
 def PI_Grow(ind_class, pop_size, bnf_grammar, min_init_depth,
             max_init_depth, codon_size, codon_consumption,
             genome_representation):
-
+    """
+    
+    Parameters
+    ----------
+    ind_class : class
+        Individual class (typically creator.Individual from DEAP).
+    pop_size : int
+        Population size.
+    bnf_grammar : Grammar
+        Parsed BNF grammar object.
+    min_init_depth : int
+        Minimum initialisation tree depth (may be raised internally 
+        to avoid depths below the grammar's minimum derivation depth 
+        + 1).
+    max_init_depth : int
+        Maximum initialisation tree depth.
+    codon_size : int
+        Maximum codon value (e.g., 255).
+    codon_consumption : str
+        'eager' or 'lazy'. Determines codon consumption strategy.
+    genome_representation : str
+        'list' or 'numpy'. Determines genome data structure.
+    
+    Returns
+    -------
+    list
+        Population of initialised individuals.
+    
+    """
     # ── Determine ramping range ──────────────────────────────────────
-    # Skip depths that can only produce trivial (single-terminal) 
-    # trees.  The effective minimum is one level above the grammar's 
-    # shallowest complete derivation.
+    # The +1 skips the shallowest depth level, which can only produce
+    # trivially small trees (often single terminals) that degrade
+    # initial population diversity.  The grammar floor additionally
+    # prevents depths below the grammar's minimum useful derivation.
     grammar_floor = _grammar_min_derivation_depth(bnf_grammar) + 1
-    effective_min = max(min_init_depth, grammar_floor)
+    effective_min = max(min_init_depth + 1, grammar_floor)
     effective_min = min(effective_min, max_init_depth)   # safety clamp
     
     n_depth_levels = max_init_depth - effective_min + 1
