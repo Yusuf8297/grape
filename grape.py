@@ -559,7 +559,7 @@ def sensible_initialisation(ind_class, pop_size, bnf_grammar, min_init_depth,
 def PI_Grow(ind_class, pop_size, bnf_grammar, min_init_depth,
             max_init_depth, codon_size, codon_consumption,
             genome_representation):
-    """Position Independent Grow initialisation (Fagan et al., 2016).
+    """Position Independent Grow initialisation.
 
     Generates a population ramped across depths. Each individual is built
     using true PI Grow: non-terminals are expanded in RANDOM order with
@@ -570,7 +570,7 @@ def PI_Grow(ind_class, pop_size, bnf_grammar, min_init_depth,
     """
     # ── Grammar-aware minimum ramp depth ──
     # Ensures the shallowest target depth allows at least one recursive
-    # production at the root (matches PonyGE2's min_ramp + 1).
+    # production at the root.
     start_idx = bnf_grammar.non_terminals.index(bnf_grammar.start_rule)
     recursive_prs = [PR for PR in bnf_grammar.production_rules[start_idx] if PR[4]]
     if recursive_prs:
@@ -587,10 +587,8 @@ def PI_Grow(ind_class, pop_size, bnf_grammar, min_init_depth,
 
     for i in range(n_depths):
         target_depth = effective_min_depth + i
-        # Assign surplus individuals to the DEEPEST buckets (matches PonyGE2 convention).
+        # Assign surplus individuals to the DEEPEST buckets.
         # Previously "i < remaining_" allocated extras to the shallowest buckets,
-        # which biased the population mean depth ~0.04 units below PonyGE2 on every
-        # benchmark (confirmed Pagie-1 and PIMA, p < 0.001).
         n_inds = set_size + (1 if i >= n_depths - remaining_ else 0)
 
         for j in range(n_inds):
@@ -599,7 +597,7 @@ def PI_Grow(ind_class, pop_size, bnf_grammar, min_init_depth,
             # ══════════════════════════════════════════════════════════
             # Tree node format: [nt, depth, chosen_PR, n_total_options, children_list]
             #   nt             — non-terminal string, e.g. '<e>'
-            #   depth          — depth of this node (1-based, same as GRAPE)
+            #   depth          — depth of this node (1-based)
             #   chosen_PR      — the production rule chosen for this node
             #   n_total_options— total # of production rules for this NT
             #   children_list  — list of child tree nodes (NTs from the chosen PR)
